@@ -1,0 +1,534 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  End-to-end serverless IoT streaming pipeline:
+  MSK Serverless → Lambda/Firehose → DynamoDB/S3
+
+Parameters:
+  ArtifactsBucket:
+    Type: String
+    Description: S3 bucket containing packaged Lambda ZIPs (created by deploy.sh)
+  TopicName:
+    Type: String
+    Default: modem-telemetry
+    Description: Kafka topic name
+
+Resources:
+
+  # ─── NETWORKING ────────────────────────────────────────────────────────────
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-public"}]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-private-a"}]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-private-b"}]
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties: {Domain: vpc}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda functions SG - outbound only
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  MSKSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MSK Serverless SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9098
+          ToPort: 9098
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # ─── MSK SERVERLESS ────────────────────────────────────────────────────────
+
+  MSKCluster:
+    Type: AWS::MSK::ServerlessCluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      VpcConfigs:
+        - SubnetIds:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+          SecurityGroups:
+            - !Ref MSKSecurityGroup
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true
+
+  # ─── STORAGE ───────────────────────────────────────────────────────────────
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-data-lake-${AWS::AccountId}"
+
+  DeviceStatusTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${AWS::StackName}-device-status"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+
+  # ─── IAM ROLES ─────────────────────────────────────────────────────────────
+
+  LambdaBasePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+            Resource: "*"
+          - Effect: Allow
+            Action: kafka:GetBootstrapBrokers
+            Resource: !Ref MSKCluster
+
+  ProducerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-producer-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasePolicy
+      Policies:
+        - PolicyName: MSKWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:WriteData
+                  - kafka-cluster:DescribeTopic
+                Resource:
+                  - !Ref MSKCluster
+                  - !Sub "${MSKCluster}/*"
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-consumer-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasePolicy
+      Policies:
+        - PolicyName: MSKReadDynamo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:DescribeTopic
+                  - kafka-cluster:DescribeGroup
+                  - kafka-cluster:AlterGroup
+                Resource:
+                  - !Ref MSKCluster
+                  - !Sub "${MSKCluster}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt DeviceStatusTable.Arn
+              - Effect: Allow
+                Action:
+                  - kafka:DescribeClusterV2
+                  - kafka:GetBootstrapBrokers
+                Resource: !Ref MSKCluster
+
+  TopicCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-topic-creator-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasePolicy
+      Policies:
+        - PolicyName: MSKAdmin
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:CreateTopic
+                  - kafka-cluster:DescribeTopic
+                Resource:
+                  - !Ref MSKCluster
+                  - !Sub "${MSKCluster}/*"
+              - Effect: Allow
+                Action:
+                  - kafka:DescribeClusterV2
+                  - kafka:GetBootstrapBrokers
+                Resource: !Ref MSKCluster
+
+  S3CleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-s3cleanup-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasePolicy
+      Policies:
+        - PolicyName: S3Cleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub "${DataLakeBucket.Arn}/*"
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-firehose-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: firehose.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:DescribeTopic
+                  - kafka-cluster:DescribeGroup
+                  - kafka-cluster:AlterGroup
+                Resource:
+                  - !Ref MSKCluster
+                  - !Sub "${MSKCluster}/*"
+              - Effect: Allow
+                Action:
+                  - kafka:GetBootstrapBrokers
+                  - kafka:DescribeClusterV2
+                Resource: !Ref MSKCluster
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub "${DataLakeBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeProducer
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ProducerFunction.Arn
+
+  # ─── LAMBDA FUNCTIONS ──────────────────────────────────────────────────────
+
+  TopicCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-topic-creator"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt TopicCreatorRole.Arn
+      Timeout: 120
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: topic_creator.zip
+      Environment:
+        Variables:
+          CLUSTER_ARN: !Ref MSKCluster
+
+  ProducerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-producer"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt ProducerRole.Arn
+      Timeout: 60
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: producer.zip
+      Environment:
+        Variables:
+          CLUSTER_ARN: !Ref MSKCluster
+          TOPIC_NAME: !Ref TopicName
+
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-consumer"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt ConsumerRole.Arn
+      Timeout: 60
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: consumer.zip
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref DeviceStatusTable
+
+  S3CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-s3-cleanup"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt S3CleanupRole.Arn
+      Timeout: 300
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: s3_cleanup.zip
+
+  # ─── CUSTOM RESOURCES ──────────────────────────────────────────────────────
+
+  TopicCreatorResource:
+    Type: Custom::KafkaTopic
+    DependsOn: MSKCluster
+    Properties:
+      ServiceToken: !GetAtt TopicCreatorFunction.Arn
+      ClusterArn: !Ref MSKCluster
+      TopicName: !Ref TopicName
+
+  S3CleanupResource:
+    Type: Custom::BucketCleanup
+    Properties:
+      ServiceToken: !GetAtt S3CleanupFunction.Arn
+      BucketName: !Ref DataLakeBucket
+
+  # ─── KINESIS FIREHOSE ──────────────────────────────────────────────────────
+
+  FirehoseStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - TopicCreatorResource
+      - FirehoseRole
+    Properties:
+      DeliveryStreamName: !Sub "${AWS::StackName}-firehose"
+      DeliveryStreamType: MSKAsSource
+      MSKSourceConfiguration:
+        MSKClusterARN: !Ref MSKCluster
+        TopicName: !Ref TopicName
+        AuthenticationConfiguration:
+          RoleARN: !GetAtt FirehoseRole.Arn
+          Connectivity: PRIVATE
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "streaming-data-lake/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        ErrorOutputPrefix: "streaming-data-lake-errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+
+  # ─── EVENTBRIDGE SCHEDULER ─────────────────────────────────────────────────
+
+  ProducerSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-producer-schedule"
+      ScheduleExpression: "rate(1 minute)"
+      FlexibleTimeWindow: {Mode: "OFF"}
+      Target:
+        Arn: !GetAtt ProducerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+
+  # ─── MSK EVENT SOURCE MAPPING ──────────────────────────────────────────────
+
+  ConsumerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: TopicCreatorResource
+    Properties:
+      EventSourceArn: !Ref MSKCluster
+      FunctionName: !GetAtt ConsumerFunction.Arn
+      StartingPosition: TRIM_HORIZON
+      Topics:
+        - !Ref TopicName
+
+# ─── OUTPUTS ─────────────────────────────────────────────────────────────────
+
+Outputs:
+  MSKClusterArn:
+    Description: MSK Serverless Cluster ARN
+    Value: !Ref MSKCluster
+
+  DynamoDBTable:
+    Description: DynamoDB table for real-time device status
+    Value: !Ref DeviceStatusTable
+
+  DataLakeBucket:
+    Description: S3 bucket for the data lake
+    Value: !Ref DataLakeBucket
+
+  FirehoseStream:
+    Description: Kinesis Firehose delivery stream name
+    Value: !Ref FirehoseStream

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+venv/
+.venv/
+env/
+
+# AWS/Lambda
+.env
+*.pem
+*.key
+*.crt
+.aws/
+
+# Build
+*.zip
+dist/
+lambda/producer/package/
+lambda/topic_creator/package/
+lambda/consumer/package/
+lambda/s3_cleanup/package/
+
+# OS
+.DS_Store
